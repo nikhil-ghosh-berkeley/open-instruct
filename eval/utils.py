@@ -7,7 +7,7 @@ import os
 from transformers import StoppingCriteria
 from peft import PeftModel
 
-#from open_instruct.finetune import encode_with_prompt_completion_format
+from open_instruct.finetune import encode_with_prompt_completion_format
 from eval.dispatch_openai_requests import dispatch_openai_chat_requesets, dispatch_openai_prompt_requesets
 
 
@@ -29,7 +29,7 @@ class KeyWordsCriteria(StoppingCriteria):
     
     
 @torch.no_grad()
-def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequences=None, disable_tqdm=False, **generation_kwargs):
+def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequences=None, add_special_tokens=True, disable_tqdm=False, **generation_kwargs):
     generations = []
     if not disable_tqdm:
         progress = tqdm.tqdm(total=len(prompts), desc="Generating Completions")
@@ -37,7 +37,7 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
     num_return_sequences = generation_kwargs.get("num_return_sequences", 1)
     for i in range(0, len(prompts), batch_size):
         batch_prompts = prompts[i:i+batch_size]
-        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=False)
+        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
         batch_input_ids = tokenized_prompts.input_ids
         attention_mask = tokenized_prompts.attention_mask
 
@@ -97,14 +97,14 @@ def generate_completions(model, tokenizer, prompts, batch_size=1, stop_id_sequen
 
 
 @torch.no_grad()
-def get_next_word_predictions(model, tokenizer, prompts, candidate_token_ids=None, batch_size=1, return_token_predictions=False, disable_tqdm=False):
+def get_next_word_predictions(model, tokenizer, prompts, candidate_token_ids=None, batch_size=1, return_token_predictions=False, add_special_tokens=True, disable_tqdm=False):
     predictions, probs = [], []
     if not disable_tqdm:
         progress = tqdm.tqdm(total=len(prompts), desc="Getting Predictions")
 
     for i in range(0, len(prompts), batch_size):
         batch_prompts = prompts[i: i+batch_size]
-        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=False)
+        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=add_special_tokens)
         batch_input_ids = tokenized_prompts.input_ids
         attention_mask = tokenized_prompts.attention_mask
 
@@ -112,7 +112,7 @@ def get_next_word_predictions(model, tokenizer, prompts, candidate_token_ids=Non
             batch_input_ids = batch_input_ids.cuda()
             attention_mask = attention_mask.cuda()
 
-        batch_logits = model(batch_input_ids, attention_mask).logits[:, -1, :]
+        batch_logits = model(input_ids=batch_input_ids, attention_mask=attention_mask).logits[:, -1, :]
         if candidate_token_ids is not None:
             batch_logits = batch_logits[:, candidate_token_ids]
         batch_probs = torch.softmax(batch_logits, dim=-1)
@@ -190,25 +190,16 @@ def load_hf_lm_and_tokenizer(
         model_name_or_path, 
         tokenizer_name_or_path=None, 
         device_map="auto", 
+        torch_dtype="auto",
         load_in_8bit=False, 
-        load_in_half=False,
+        convert_to_half=False,
         gptq_model=False,
         use_fast_tokenizer=False,
         adapter_path=None,
         padding_side="left",
     ):
     
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    if not tokenizer_name_or_path:
-        tokenizer_name_or_path = model_name_or_path
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=use_fast_tokenizer)
-    # set padding side to left for batch generation
-    tokenizer.padding_side = padding_side
-    # set pad token to eos token if pad token is not set (as is the case for llama models)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    from transformers import AutoModelForCausalLM, AutoTokenizer, OPTForCausalLM, GPTNeoXForCausalLM
 
     if gptq_model:
         from auto_gptq import AutoGPTQForCausalLM
@@ -224,16 +215,37 @@ def load_hf_lm_and_tokenizer(
         )
     else:
         if device_map:
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, device_map=device_map)
+            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, device_map=device_map, torch_dtype=torch_dtype)
         else:
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
+            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch_dtype)
             if torch.cuda.is_available():
                 model = model.cuda()
-        if load_in_half:
+        if convert_to_half:
             model = model.half()
     if adapter_path is not None:
         model = PeftModel.from_pretrained(model, adapter_path)
     model.eval()
+
+    if not tokenizer_name_or_path:
+        tokenizer_name_or_path = model_name_or_path
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=use_fast_tokenizer)
+    except:
+        # some tokenizers (e.g., GPTNeoXTokenizer) don't have the slow or fast version, so we just roll back to the default one
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
+    # set padding side to left for batch generation
+    tokenizer.padding_side = padding_side
+    # set pad token to eos token if pad token is not set (as is the case for llama models)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # for OPT and Pythia models, we need to set tokenizer.model_max_length to model.config.max_position_embeddings 
+    # to avoid wrong embedding index.    
+    if isinstance(model, GPTNeoXForCausalLM) or isinstance(model, OPTForCausalLM):
+        tokenizer.model_max_length = model.config.max_position_embeddings
+        print("Set tokenizer.model_max_length to model.config.max_position_embeddings: {}".format(model.config.max_position_embeddings))
+        
     return model, tokenizer
 
 

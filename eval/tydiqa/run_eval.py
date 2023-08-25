@@ -2,6 +2,7 @@ import argparse
 import os
 import json
 import random
+import torch
 import evaluate
 import numpy as np
 from eval.utils import generate_completions, load_hf_lm_and_tokenizer, query_openai_chat_model
@@ -96,7 +97,7 @@ def main(args):
             model_name_or_path=args.model_name_or_path, 
             tokenizer_name_or_path=args.tokenizer_name_or_path, 
             load_in_8bit=args.load_in_8bit, 
-            load_in_half=True,
+            device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
             gptq_model=args.gptq
         )
     else:
