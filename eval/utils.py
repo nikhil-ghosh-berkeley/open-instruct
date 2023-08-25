@@ -5,6 +5,7 @@ import time
 import asyncio
 import os
 from transformers import StoppingCriteria
+from peft import PeftModel
 
 #from open_instruct.finetune import encode_with_prompt_completion_format
 from eval.dispatch_openai_requests import dispatch_openai_chat_requesets, dispatch_openai_prompt_requesets
@@ -193,6 +194,7 @@ def load_hf_lm_and_tokenizer(
         load_in_half=False,
         gptq_model=False,
         use_fast_tokenizer=False,
+        adapter_path=None,
         padding_side="left",
     ):
     
@@ -229,6 +231,8 @@ def load_hf_lm_and_tokenizer(
                 model = model.cuda()
         if load_in_half:
             model = model.half()
+    if adapter_path is not None:
+        model = PeftModel.from_pretrained(model, adapter_path)
     model.eval()
     return model, tokenizer
 

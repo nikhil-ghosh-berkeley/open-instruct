@@ -11,14 +11,23 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 from functools import partial
+import pickle
+import argparse
 import datasets
+from functools import reduce
 import torch
+import numpy as np
+import copy
+from tqdm import tqdm
+import evaluate
 from datasets import load_dataset
+import bitsandbytes as bnb
 
 import transformers
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
+    BitsAndBytesConfig,
     AutoTokenizer,
     LlamaTokenizer,
     HfArgumentParser,
@@ -30,129 +39,14 @@ from transformers import (
     OPTForCausalLM
 )
 from transformers.trainer_utils import get_last_checkpoint
-from safe_save_trainer import SafeSaveTrainer
-from peft import LoraConfig, TaskType, get_peft_model
+from transformers.custom_utils import SelectorGenerator
+from custom_safe_save_trainer import CustomSafeSaveTrainer
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel, prepare_model_for_kbit_training
+from mup import zip_infshapes
+from custom_arguments import ModelArguments, DataTrainingArguments
+from peft.tuners.lora import LoraLayer
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ModelArguments:
-    """
-    Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
-    """
-
-    model_name_or_path: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "The model checkpoint for weights initialization. Don't set if you want to train a model from scratch."
-            )
-        },
-    )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
-    )
-    tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
-    )
-    cache_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
-    )
-    use_fast_tokenizer: bool = field(
-        default=False,
-        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
-    )
-    model_revision: str = field(
-        default="main",
-        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
-    )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Will use the token generated when running `huggingface-cli login` (necessary to use this script "
-                "with private models)."
-            )
-        },
-    )
-    use_flash_attn: bool = field(
-        default=False,
-        metadata={"help": "if true, use flash attention"}
-    )
-    torch_dtype: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Override the default `torch.dtype` and load the model under this dtype. If `auto` is passed, the "
-                "dtype will be automatically derived from the model's weights."
-            ),
-            "choices": ["auto", "bfloat16", "float16", "float32"],
-        },
-    )
-    use_lora: bool = field(
-        default=False,
-        metadata={"help": "If passed, will use LORA (low-rank parameter-efficient training) to train the model."}
-    )
-    lora_rank: int = field(
-        default=64,
-        metadata={"help": "Lora R dimension."}
-    )
-    lora_alpha: float = field(
-        default=16,
-        metadata={"help": " Lora alpha."}
-    )
-    lora_dropout: float = field(
-        default=0.0,
-        metadata={"help":"Lora dropout."}
-    )
-
-
-@dataclass
-class DataTrainingArguments:
-    """
-    Arguments pertaining to what data we are going to input our model for training and eval.
-    """
-
-    dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
-    )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    )
-    train_file: Optional[str] = field(default=None, metadata={"help": "The input training data file (a json/jsonl file)."})
-    max_train_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "For debugging purposes or quicker training, truncate the number of training examples to this "
-                "value if set."
-            )
-        },
-    )
-    streaming: bool = field(default=False, metadata={"help": "Enable streaming mode"})
-    overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
-    )
-    preprocessing_num_workers: Optional[int] = field(
-        default=None,
-        metadata={"help": "The number of processes to use for the preprocessing."},
-    )
-    max_seq_length: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": ("The maximum total input sequence length after tokenization. Sequences longer than this will be truncated,")
-        },
-    )
-
-    def __post_init__(self):
-        if self.dataset_name is None and self.train_file is None:
-            raise ValueError("Need either a dataset name or a training file.")
-        else:
-            if self.train_file is not None:
-                extension = self.train_file.split(".")[-1]
-                assert extension in ["json", "jsonl"], "`train_file` should be a json or a jsonl file."
 
 def encode_with_prompt_completion_format(example, tokenizer, max_seq_length):
     '''
@@ -178,6 +72,7 @@ def encode_with_prompt_completion_format(example, tokenizer, max_seq_length):
         'labels': labels.flatten(),
         'attention_mask': attention_mask.flatten(),
     }
+
 
 def encode_with_messages_format(example, tokenizer, max_seq_length):
     '''
@@ -238,13 +133,137 @@ def encode_with_messages_format(example, tokenizer, max_seq_length):
         'attention_mask': attention_mask.flatten(),
     }
 
+def insert_modified_params(model, output_dir, subsamp_ratio):
+    modified_param_names = ['base_model.model.model.embed_tokens.weight', 'base_model.model.lm_head.weight']
+    modified_params_path = os.path.join(output_dir, f"modified_params_{subsamp_ratio}.pt")
+    if os.path.exists(modified_params_path):
+        modified_params = torch.load(modified_params_path)
+        for name in modified_param_names:
+            module_names = name.split(sep=".")[:-1]
+            module = reduce(getattr, module_names, model)
+            with torch.no_grad():
+                module.weight.copy_(modified_params[name])
+    else:
+        state_dict = model.state_dict()
+        modified_params = {}
+        for name in modified_param_names:
+            modified_params[name] = state_dict[name]
+        torch.save(modified_params, modified_params_path)
+
+def find_all_linear_names(args, model):
+    cls = bnb.nn.Linear4bit if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if isinstance(module, cls):
+            names = name.split('.')
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+
+
+    if 'lm_head' in lora_module_names: # needed for 16-bit
+        lora_module_names.remove('lm_head')
+    return list(lora_module_names)
+
+def get_accelerate_model(args, checkpoint_dir, model_config=None, device_map="auto"):
+    n_gpus = torch.cuda.device_count()
+    max_memory = f'{args.max_memory_MB}MB'
+    max_memory = {i: max_memory for i in range(n_gpus)}
+
+    # if we are in a distributed setting, we need to set the device map and max memory per device
+    if os.environ.get('LOCAL_RANK') is not None:
+        local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+        device_map = {'': local_rank}
+        max_memory = {'': max_memory[local_rank]}
+
+
+    if args.full_finetune: assert args.bits in [16, 32]
+
+    print(f'loading base model {args.model_name_or_path}...')
+    compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        config=model_config,
+        cache_dir=args.cache_dir,
+        load_in_4bit=args.bits == 4,
+        load_in_8bit=args.bits == 8,
+        device_map=device_map,
+        max_memory=max_memory,
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=args.bits == 4,
+            load_in_8bit=args.bits == 8,
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=False,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=args.double_quant,
+            bnb_4bit_quant_type=args.quant_type,
+        ),
+        torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
+        trust_remote_code=args.trust_remote_code,
+        use_auth_token=args.use_auth_token
+    )        
+
+    if compute_dtype == torch.float16 and args.bits == 4:
+        major, minor = torch.cuda.get_device_capability()
+        if major >= 8:
+            print('='*80)
+            print('Your GPU supports bfloat16, you can accelerate training with the argument --bf16')
+            print('='*80)
+
+    setattr(model, 'model_parallel', True)
+    setattr(model, 'is_parallelizable', True)
+
+    model.config.torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
+
+    if not args.full_finetune:
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    if not args.full_finetune:
+        if checkpoint_dir is not None:
+            print("Loading adapters from checkpoint.")
+            model = PeftModel.from_pretrained(model, checkpoint_dir, is_trainable=True)
+            # model = PeftModel.from_pretrained(model, join(checkpoint_dir, 'adapter_model'), is_trainable=True)
+        else:
+            print(f'adding LoRA modules...')
+            modules = find_all_linear_names(args, model)
+            config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=modules,
+                lora_dropout=args.lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            model = get_peft_model(model, config)
+
+    for name, module in model.named_modules():
+        if isinstance(module, LoraLayer):
+            if args.bf16:
+                module = module.to(torch.bfloat16)
+        if 'norm' in name:
+            module = module.to(torch.float32)
+        if 'lm_head' in name or 'embed_tokens' in name:
+            if hasattr(module, 'weight'):
+                if args.bf16 and module.weight.dtype == torch.float32:
+                    module = module.to(torch.bfloat16)
+    return model
+
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
-    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+    if len(sys.argv) <= 3 and sys.argv[-1].endswith(".pkl"):
+        with open(os.path.abspath(sys.argv[-1]), "rb") as args_file:
+            args_dict = pickle.load(args_file)
+        model_args, data_args, training_args = parser.parse_dict(args_dict, allow_extra_keys=True)
+    elif len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     
+    args = argparse.Namespace(
+        **vars(model_args), **vars(data_args), **vars(training_args)
+    )
+    training_args.num_training_eval_samples = data_args.num_training_eval_samples
     # A hacky way to make llama work with flash attention
     if model_args.use_flash_attn:
         from llama_flash_attn_monkey_patch import replace_llama_attn_with_flash_attn
@@ -279,16 +298,10 @@ def main():
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
-            )
-        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-            logger.info(
-                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
-                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
-            )
+        logger.info(
+            f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
+            "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+        )
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
@@ -343,28 +356,7 @@ def main():
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this finetuning script."
         )
-
-    if model_args.model_name_or_path:
-        torch_dtype = (
-            model_args.torch_dtype
-            if model_args.torch_dtype in ["auto", None]
-            else getattr(torch, model_args.torch_dtype)
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-            torch_dtype=torch_dtype,
-        )
-    else:
-        logger.warning("No pretrained model_name_or_path is given. Training new model from scratch.")
-        model = AutoModelForCausalLM.from_config(config)
-        n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
-        logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
-
+    '''
     # no default pad token for llama!
     # here we add all special tokens again, because the default ones are not in the special_tokens_map
     if isinstance(tokenizer, LlamaTokenizer):
@@ -382,23 +374,44 @@ def main():
         assert num_added_tokens == 1, "GPTNeoXTokenizer should only add one special token - the pad_token."
     elif isinstance(tokenizer, GPT2Tokenizer) and isinstance(model, OPTForCausalLM):
         num_added_tokens = tokenizer.add_special_tokens({'unk_token': '<unk>'})
+    '''
+    if model_args.model_name_or_path:
+        # model = AutoModelForCausalLM.from_pretrained(
+        #     args.model_name_or_path,
+        #     config=config,
+        #     cache_dir=args.cache_dir,
+        #     torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
+        #     trust_remote_code=args.trust_remote_code,
+        #     use_auth_token=args.use_auth_token
+        # )        
+        model = get_accelerate_model(args, checkpoint_dir=last_checkpoint, model_config=config)
+    else:
+        logger.warning("No pretrained model_name_or_path is given. Training new model from scratch.")
+        model = AutoModelForCausalLM.from_config(config)
+        n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
+        logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
 
-    # resize embeddings if needed (e.g. for LlamaTokenizer)
-    embedding_size = model.get_input_embeddings().weight.shape[0]
-    if len(tokenizer) > embedding_size:
-        model.resize_token_embeddings(len(tokenizer))
-    
-    if model_args.use_lora:
-        logger.info("Initializing LORA model...")
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM, 
-            inference_mode=False, 
-            r=model_args.lora_rank, 
-            lora_alpha=model_args.lora_alpha, 
-            lora_dropout=model_args.lora_dropout
-        )
-        model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
+
+    # LoRA
+    # if model_args.use_lora:
+    #     logger.info("Initializing LORA model...")
+    #     peft_config = LoraConfig(
+    #         task_type=TaskType.CAUSAL_LM, 
+    #         inference_mode=False, 
+    #         r=model_args.lora_rank, 
+    #         lora_alpha=model_args.lora_alpha, 
+    #         lora_dropout=model_args.lora_dropout
+    #     )
+        
+    #     model = get_peft_model(model, peft_config)
+    #     # insert_modified_params(model, training_args.output_dir, model_args.subsamp_ratio)
+    #     logger.info(model)
+    model.print_trainable_parameters()
+    infshapes_file_path = os.path.join(training_args.output_dir, "infshapes.pkl")
+    with open(infshapes_file_path, "rb") as infshapes_file:
+        infshapes = pickle.load(infshapes_file)
+    for n, p in model.named_parameters():
+        p.infshape = infshapes[n]
 
     # Preprocessing the datasets.
     if "prompt" in raw_datasets["train"].column_names and "completion" in raw_datasets["train"].column_names:
@@ -437,20 +450,29 @@ def main():
     if training_args.do_train:
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
+        if training_args.do_eval:
+            lm_datasets = lm_datasets["train"].train_test_split(test_size=args.eval_dataset_size, shuffle=True, seed=42)
+            eval_dataset = lm_datasets["test"]
+            if data_args.max_eval_samples is not None:
+                max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
+                eval_dataset = eval_dataset.select(range(max_eval_samples))
         train_dataset = lm_datasets["train"]
+        
         if data_args.max_train_samples is not None:
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
             train_dataset = train_dataset.select(range(max_train_samples))
-
+        
     # initalize a trainer
     # here we use a custom trainer that moves the model to CPU when saving the checkpoint in FSDP mode
     # we can switch to the default trainer after moving to deepspeed (let's don't change too much for now)
-    trainer = SafeSaveTrainer(
+    
+    trainer = CustomSafeSaveTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
-        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model),
+        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, max_length=data_args.max_seq_length),
     )
 
     # Training
@@ -461,7 +483,9 @@ def main():
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_model()  # Saves the tokenizer too for easy upload
+
+        final_model_dir = os.path.join(args.output_dir, "final")
+        trainer.save_model(final_model_dir)  # Saves the tokenizer too for easy upload
 
         metrics = train_result.metrics
 

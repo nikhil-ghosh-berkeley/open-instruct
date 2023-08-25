@@ -2,15 +2,25 @@
 
 # zero-shot
 python -m eval.mmlu.run_eval \
-    --ntrain 0 \
+    --ntrain 5 \
     --data_dir data/eval/mmlu \
-    --save_dir results/mmlu/alpaca-7B-0shot/ \
-    --model_name_or_path ../checkpoints/llama_7B_large_mix/ \
-    --tokenizer_name_or_path ../checkpoints/llama_7B_large_mix/ \
+    --save_dir results/mmlu/llama_7b/ \
+    --model_name_or_path output/flan_v2_7B/subsamp_model \
+    --tokenizer_name_or_path output/flan_v2_7B/subsamp_model \
+    --adapter_path output/flan_v2_7B/checkpoint-2000 \
     --eval_batch_size 2 \
     --load_in_8bit \
     --use_chat_format
 
+# python -m eval.mmlu.run_eval \
+#     --ntrain 5 \
+#     --data_dir data/eval/mmlu \
+#     --save_dir results/mmlu/llama_7b_pretrained/ \
+#     --model_name_or_path output/flan_v2_7B/subsamp_model \
+#     --tokenizer_name_or_path output/flan_v2_7B/subsamp_model \
+#     --eval_batch_size 2 \
+#     --load_in_8bit \
+#     --use_chat_format
 
 # # zero-shot with chatgpt
 # python -m eval.mmlu.run_eval \
