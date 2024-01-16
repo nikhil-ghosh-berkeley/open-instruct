@@ -1,18 +1,22 @@
 
 '''
-This script is used to get models' predictions on a set of prompts (put in files with *.jsonl format, with the prompt in a `prompt` field).
+This script is used to get models' predictions on a set of prompts (put in files with *.jsonl format, 
+with the prompt in a `prompt` field or the conversation history in a `messages` field).
 
 For example, to get predictions on a set of prompts, you should put them in a file with the following format:
     {"id": <uniq_id>, "prompt": "Plan a trip to Paris."}
+    ...
+Or you can use the messages format:
+    {"id": <uniq_id>, "messages": [{"role": "user", "content": "Plan a trip to Paris."}]}
     ...
 
 Then you can run this script with the following command:
     python eval/predict.py \
         --model_name_or_path <huggingface_model_name_or_path> \
-        --input_files <input_files> \
+        --input_files <input_file_1> <input_file_2> ... \
         --output_file <output_file> \
         --batch_size <batch_size> \
-        --load_in_8bit
+        --use_vllm
 '''
 
 
@@ -21,15 +25,7 @@ import json
 import os
 import vllm
 import torch
-from eval.utils import generate_completions, load_hf_lm_and_tokenizer, query_openai_chat_model
-
-
-# If you want to include system prompt, see this discussion for the template: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGML/discussions/4
-# However, see here that removing the system prompt actually reduce the false refusal rates: https://github.com/facebookresearch/llama/blob/main/UPDATES.md?utm_source=twitter&utm_medium=organic_social&utm_campaign=llama2&utm_content=text#observed-issue
-llama2_prompting_template = '''[INST] {prompt} [/INST]'''
-
-# See the tulu template here: https://huggingface.co/allenai/tulu-7b#input-format
-tulu_prompting_template = '''<|user|>\n{prompt}\n<|assistant|>\n'''
+from eval.utils import generate_completions, load_hf_lm_and_tokenizer, query_openai_chat_model, dynamic_import_function
 
 
 def parse_args():
@@ -37,23 +33,31 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default=None,
         help="Huggingface model name or path.")
+    parser.add_argument(
+        "--tokenizer_name_or_path",
+        type=str,
+        help="Huggingface tokenizer name or path."
+    )
+    parser.add_argument(
+        "--use_slow_tokenizer",
+        action="store_true",
+        help="If given, we will use the slow tokenizer."
+    )
     parser.add_argument(
         "--openai_engine", 
         type=str,
-        default=None,
-        help="OpenAI engine name.")
+        help="OpenAI engine name. This should be exclusive with `model_name_or_path`.")
     parser.add_argument(
         "--input_files", 
         type=str, 
         nargs="+",
-        help="Input .jsonl files containing `id`s and `prompt`s.")
+        help="Input .jsonl files, with each line containing `id` and `prompt` or `messages`.")
     parser.add_argument(
         "--output_file",
         type=str,
         default="output/model_outputs.jsonl",
-        help="Output .jsonl file containing `id`s, `prompt`s, and `output`s.")
+        help="Output .jsonl file, with each line containing `id`, `prompt` or `messages`, and `output`.")
     parser.add_argument(
         "--batch_size",
         type=int,
@@ -77,11 +81,16 @@ def parse_args():
         action="store_true", 
         help="If given, we will use the vllm library, which will likely increase the inference throughput.")
     parser.add_argument(
-        "--prompt_format",
-        type=str,
-        default="plain",
-        choices=["plain", "tulu-chat", "llama2-chat"], 
-        help="encoding format of the prompt; this is only effective for local huggingface models.")
+        "--use_chat_format", 
+        action="store_true", 
+        help="If given, we will use the chat format for the prompts."
+    )
+    parser.add_argument(
+        "--chat_formatting_function", 
+        type=str, 
+        default="eval.templates.create_prompt_with_tulu_chat_format", 
+        help="The function to use to create the chat format. This function will be dynamically imported. Please see examples in `eval/templates.py`."
+    )
     parser.add_argument(
         "--max_new_tokens",
         type=int,
@@ -123,18 +132,31 @@ if __name__ == "__main__":
             instances = [json.loads(x) for x in f.readlines()]
 
     if args.model_name_or_path is not None:
-        if args.prompt_format == "tulu-chat":
-            prompts = [
-                tulu_prompting_template.format(prompt=x["prompt"]) for x in instances
-            ]
-        elif args.prompt_format == "llama2-chat":
-            prompts = [
-                llama2_prompting_template.format(prompt=x["prompt"]) for x in instances
-            ]
-        else:
-            prompts = [x["prompt"] for x in instances]
+        prompts = []
+        chat_formatting_function = dynamic_import_function(args.chat_formatting_function) if args.use_chat_format else None
+        for instance in instances:
+            if "messages" in instance:
+                if not args.use_chat_format:
+                    raise ValueError("If `messages` is in the instance, `use_chat_format` should be True.")
+                assert all("role" in message and "content" in message for message in instance["messages"]), \
+                    "Each message should have a `role` and a `content` field."
+                prompt = eval(args.chat_formatting_function)(instance["messages"], add_bos=False)
+            elif "prompt" in instance:
+                if args.use_chat_format:
+                    messages = [{"role": "user", "content": instance["prompt"]}]
+                    prompt = chat_formatting_function(messages, add_bos=False)
+                else:
+                    prompt = instance["prompt"]
+            else:
+                raise ValueError("Either `messages` or `prompt` should be in the instance.")
+            prompts.append(prompt)
         if args.use_vllm:
-            model = vllm.LLM(model=args.model_name_or_path)
+            model = vllm.LLM(
+                model=args.model_name_or_path,
+                tokenizer=args.tokenizer_name_or_path if args.tokenizer_name_or_path else args.model_name_or_path,
+                tokenizer_mode="slow" if args.use_slow_tokenizer else "auto",
+                tensor_parallel_size=torch.cuda.device_count(),
+            )
             sampling_params = vllm.SamplingParams(
                 temperature=args.temperature if args.do_sample else 0, 
                 top_p=args.top_p,
@@ -148,7 +170,8 @@ if __name__ == "__main__":
                 tokenizer_name_or_path=args.tokenizer_name_or_path,
                 load_in_8bit=args.load_in_8bit, 
                 device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
-                gptq_model=args.gptq
+                gptq_model=args.gptq,
+                use_fast_tokenizer=not args.use_slow_tokenizer,
             )
             outputs = generate_completions(
                 model=model,
